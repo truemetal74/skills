@@ -58,6 +58,18 @@ is STRUCTURAL drift; note it even if not fixing now.
 - [ ] nginx.conf: no-cache for BOTH `index.html` and `/config.js`; 1y `/assets/` caching;
       security headers; `port_in_redirect off`
 - [ ] `docker-entrypoint.sh` lists every `VITE_*` key the app's `config.ts` reads
+- [ ] Secrets out of every build context (rule 8): for EACH service dir, check whichever
+      the deploy script actually uses: `gcloud meta list-files-for-upload <dir>` (Cloud
+      Build) and the docker context (`printf 'FROM scratch\nCOPY . /\n' | docker build -f-
+      --output type=local,dest=<tmp> <dir>`). Neither may contain `.env*` (examples
+      aside), `.config/`, `vars/*.yaml` or `*.key`. Worst case: a Python image with
+      `COPY . /app/` and no `.dockerignore`. A `RUN rm` does not count: the file stays in
+      the layer. A key that already shipped must be rotated, not just excluded. Before
+      excluding `.env*` from a Vite front-end, check that its build doesn't read
+      `.env.production` (runtime `config.js` projects don't).
+- [ ] Deploy scripts never `gcloud config set project|account` (rule 9); `--project`/
+      `--account` on every call; no `$ErrorActionPreference = "Stop"` around gcloud/docker
+      (rule 10)
 
 ## 7. GCP setup (skill: gcp-bootstrap)
 

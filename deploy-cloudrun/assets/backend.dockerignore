@@ -1,0 +1,20 @@
+# Copy to back-end/.dockerignore AND back-end/.gcloudignore (same content).
+# Cloud Build uploads what .gcloudignore lets through (the tarball stays in the
+# project's <project>_cloudbuild bucket), then docker build filters by
+# .dockerignore. The secret patterns mean the same in both syntaxes (`**/` = any
+# depth, a leading `/` = this folder only); plain names like `.git` match only at
+# the top in .dockerignore but at any depth in .gcloudignore, which is harmless.
+
+# --- Secrets: never in a build context (SKILL.md rule 8) ----------------------
+# A `RUN rm` after `COPY . /app/` does NOT take a file out of the image: it stays
+# in the COPY layer, readable by anyone who can pull the image.
+**/.env*
+**/.config
+/vars
+
+# --- Not part of the image ----------------------------------------------------
+**/.venv
+**/__pycache__
+**/.pytest_cache
+.git
+/tests

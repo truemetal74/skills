@@ -1,0 +1,28 @@
+# Copy to the front-end's .dockerignore AND .gcloudignore (same content).
+# Cloud Build uploads what .gcloudignore lets through (the tarball stays in the
+# project's <project>_cloudbuild bucket), then docker build filters by
+# .dockerignore. The secret patterns mean the same in both syntaxes (`**/` = any
+# depth, a leading `/` = this folder only); plain names like `.git` match only at
+# the top in .dockerignore but at any depth in .gcloudignore, which is harmless.
+
+# --- Secrets: never in a build context (SKILL.md rule 8) ----------------------
+# The build stage runs `COPY . .`, so anything not excluded here is uploaded and
+# copied. Front-end config is injected at container start (config.js), so no
+# .env file is needed for the build.
+**/.env*
+**/.config
+/vars
+# For a front-end that lives at the repo root: keep the back-end (its
+# .env_pydantic and vars/) out too. Harmless when there is no such folder.
+/back-end
+
+# --- Not part of the build ----------------------------------------------------
+node_modules
+dist
+.git
+# Local agent and tool state
+.claude
+.gstack
+.remember
+.superpowers
+.playwright-mcp

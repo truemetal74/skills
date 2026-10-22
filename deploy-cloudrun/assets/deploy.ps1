@@ -11,7 +11,12 @@
     .\deploy.ps1 all                               # staging, local Docker build
     .\deploy.ps1 all -CloudBuild                   # staging, Cloud Build (no local Docker)
     .\deploy.ps1 back-end -Production              # production backend
+    .\deploy.ps1 all -Account deployer@my-app.iam.gserviceaccount.com   # as a deployer SA
     $env:INITIAL_DEPLOY=1; .\deploy.ps1 all        # first deploy, prompts for env YAMLs
+
+    The script never changes the gcloud config (active project or account): other
+    projects on the same machine share it. Every gcloud call gets --project (and
+    --account when given) explicitly.
 #>
 
 param(
@@ -21,14 +26,20 @@ param(
 
     [string]$Region = "",
     [string]$ProjectId = "",
+    [string]$Account = "",  # gcloud account for this deploy only (e.g. a deployer SA)
     [switch]$Production,
     [switch]$CloudBuild  # Use Cloud Build instead of local Docker
 )
 
-$ErrorActionPreference = "Stop"
+# Not "Stop": gcloud/docker write progress and warnings to stderr, and Windows
+# PowerShell 5.1 turns each line into a terminating NativeCommandError whenever
+# output is captured (agents, CI, tee). Failures are caught via $LASTEXITCODE.
+$ErrorActionPreference = "Continue"
 
 # ============================ PROJECT CONFIG =================================
 $AppTitle    = "My App"            # display name in banners
+$DefaultProjectId = "my-app"       # GCP project id (never read from the gcloud config)
+$DefaultAccount = ""               # gcloud account to deploy as (e.g. a deployer SA); "" = active account
 $RegistryId  = "my-app"            # Artifact Registry repository name
 $RepoRegion  = "europe"            # Artifact Registry multi-region
 $DefaultRegion = "europe-west1"
@@ -57,11 +68,19 @@ VITE_DEBUG: "false"
 # Resolve defaults
 $ProjectId = if ($ProjectId) { $ProjectId }
     elseif ($env:PROJECT_ID) { $env:PROJECT_ID }
-    else { (gcloud config get-value project 2>$null) }
+    else { $DefaultProjectId }
 
 $Region = if ($Region) { $Region }
     elseif ($env:CLOUD_REGION) { $env:CLOUD_REGION }
     else { $DefaultRegion }
+
+$Account = if ($Account) { $Account }
+    elseif ($env:GCLOUD_ACCOUNT) { $env:GCLOUD_ACCOUNT }
+    else { $DefaultAccount }
+
+# Passed to every gcloud call instead of `gcloud config set`.
+$Gc = @("--project=$ProjectId")
+if ($Account) { $Gc += "--account=$Account" }
 
 $NamePrefix = if ($Production) { "" } else { "staging-" }
 $EnvLabel   = if ($Production) { "PRODUCTION" } else { "staging" }
@@ -72,9 +91,9 @@ Write-Host "================================================" -ForegroundColor C
 Write-Host "Project:  $ProjectId"
 Write-Host "Region:   $Region"
 Write-Host "Service:  $Service"
+if ($Account) { Write-Host "Account:  $Account" }
 Write-Host ""
 
-gcloud config set project $ProjectId
 gcloud auth configure-docker "$RepoRegion-docker.pkg.dev" --quiet
 
 function Deploy-Service {
@@ -94,12 +113,25 @@ function Deploy-Service {
     if ($CloudBuild) {
         # Cloud Build: builds remotely, no local Docker needed
         Write-Host "Building via Cloud Build -> $image ..." -ForegroundColor Cyan
-        gcloud builds submit `
-            --project=$ProjectId `
-            --region=$Region `
-            --tag=$image `
-            --quiet
-        if ($LASTEXITCODE -ne 0) { Pop-Location; throw "Cloud Build failed for $ServiceName" }
+        if ($Account) {
+            # Streaming build logs needs project Viewer, which a deployer SA usually
+            # lacks: gcloud exits 1 while the build keeps running (--suppress-logs
+            # does not help). Submit async and poll the build status instead.
+            $buildId = gcloud builds submit @Gc --region=$Region --tag=$image --async --quiet --format="value(id)"
+            if ($LASTEXITCODE -ne 0 -or -not $buildId) { Pop-Location; throw "Cloud Build submit failed for $ServiceName" }
+            Write-Host "Build $buildId (logs: https://console.cloud.google.com/cloud-build/builds;region=$Region/$($buildId)?project=$ProjectId)"
+            do {
+                Start-Sleep -Seconds 10
+                $status = gcloud builds describe $buildId @Gc --region=$Region --format="value(status)"
+            } while ($status -in @("QUEUED", "PENDING", "WORKING"))
+            if ($status -ne "SUCCESS") { Pop-Location; throw "Cloud Build $buildId ended $status for $ServiceName" }
+        } else {
+            gcloud builds submit @Gc `
+                --region=$Region `
+                --tag=$image `
+                --quiet
+            if ($LASTEXITCODE -ne 0) { Pop-Location; throw "Cloud Build failed for $ServiceName" }
+        }
     } else {
         # Local Docker: faster iteration, can test locally before pushing
         Write-Host "Building locally -> $image ..." -ForegroundColor Cyan
@@ -108,7 +140,11 @@ function Deploy-Service {
 
         Write-Host "Pushing to Artifact Registry..." -ForegroundColor Cyan
         docker tag $ServiceName $image
-        docker push $image
+        # Docker's gcloud credential helper ignores --account; this env var points
+        # it (and only this push) at $Account without touching the gcloud config.
+        $prevAccount = $env:CLOUDSDK_CORE_ACCOUNT
+        if ($Account) { $env:CLOUDSDK_CORE_ACCOUNT = $Account }
+        try { docker push $image } finally { $env:CLOUDSDK_CORE_ACCOUNT = $prevAccount }
         if ($LASTEXITCODE -ne 0) { Pop-Location; throw "Docker push failed for $ServiceName" }
     }
 
@@ -152,11 +188,11 @@ function Deploy-Service {
     }
 
     Write-Host "Deploying to Cloud Run..." -ForegroundColor Green
-    gcloud run deploy @deployArgs
+    gcloud run deploy @deployArgs @Gc
 
     if ($LASTEXITCODE -eq 0) {
         Write-Host "$ServiceName deployed successfully!" -ForegroundColor Green
-        $url = gcloud run services describe $ServiceName --region $Region --format="value(status.url)"
+        $url = gcloud run services describe $ServiceName @Gc --region $Region --format="value(status.url)"
         Write-Host "URL: $url" -ForegroundColor Cyan
         return $url
     } else {

@@ -24,7 +24,9 @@ COPY ./vendor/ /app/vendor/
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
 COPY . /app/
-# Remove local config — all config comes from environment variables
+# Remove local config — all config comes from environment variables.
+# Belt and braces only: a file removed here still ships inside the COPY layer
+# above. .dockerignore / .gcloudignore are what keep secrets out (SKILL.md rule 8).
 RUN rm -f /app/.env /app/.env_pydantic
 RUN chmod 755 /app/start-web-server.sh
 
