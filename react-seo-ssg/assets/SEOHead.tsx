@@ -1,133 +1,139 @@
-import { useEffect } from "react";
+import { useEffect } from 'react';
 
-const SITE_NAME = "Perfect Resume";
-const SITE_URL = "https://example.com"; // PROJECT CONFIG: canonical site URL
+/**
+ * Per-page <title>, meta description, canonical, Open Graph/Twitter cards and
+ * JSON-LD, applied to document.head as an effect.
+ *
+ * WHY AN EFFECT AND NOT JUST index.html: the tags in index.html are the static
+ * baseline every crawler sees without running JavaScript (AI crawlers such as
+ * GPTBot, ClaudeBot and PerplexityBot never run any). This component lets a
+ * route OVERRIDE that baseline, and gives `prerender.js` something to wait for
+ * (`script[data-seo-schema]`) before it snapshots the DOM — so every
+ * prerendered page must pass at least one `schema`. Every tag is updated in
+ * place when index.html already declares it, so the two never both ship and
+ * duplicate each other.
+ *
+ * Returns null — it renders nothing.
+ */
+
+export const SITE_NAME = 'Example'; // PROJECT CONFIG: product name
+export const SITE_URL = 'https://example.com'; // PROJECT CONFIG: canonical site URL
+/** The link-preview image, 1200x630. PROJECT CONFIG: path under public/. */
+const OG_IMAGE = `${SITE_URL}/og-image.jpg`;
 
 interface SEOHeadProps {
   title: string;
   description: string;
-  canonical?: string;
+  /** Root-relative path, e.g. '/'. Becomes the canonical + og:url. */
+  path: string;
   schema?: Record<string, unknown> | Record<string, unknown>[];
 }
 
-export function SEOHead({ title, description, canonical, schema }: SEOHeadProps) {
+function upsertMeta(selector: string, attr: 'name' | 'property', key: string, content: string): void {
+  let el = document.querySelector(selector);
+  if (!el) {
+    el = document.createElement('meta');
+    el.setAttribute(attr, key);
+    document.head.appendChild(el);
+  }
+  el.setAttribute('content', content);
+}
+
+export function SEOHead({ title, description, path, schema }: SEOHeadProps): null {
+  // `schema` is typically a fresh object literal per render, so the serialized
+  // STRING is the dependency; object identity would rewrite head every render.
+  const schemaJson = schema ? JSON.stringify(Array.isArray(schema) ? schema : [schema]) : '';
+
   useEffect(() => {
+    const canonical = `${SITE_URL}${path}`;
     document.title = title;
 
-    // Meta description
-    let metaDesc = document.querySelector('meta[name="description"]');
-    if (!metaDesc) {
-      metaDesc = document.createElement("meta");
-      metaDesc.setAttribute("name", "description");
-      document.head.appendChild(metaDesc);
-    }
-    metaDesc.setAttribute("content", description);
+    upsertMeta('meta[name="description"]', 'name', 'description', description);
 
-    // Open Graph
-    const ogTags: Record<string, string> = {
-      "og:title": title,
-      "og:description": description,
-      "og:type": "website",
-      "og:site_name": SITE_NAME,
-      "og:url": canonical || SITE_URL,
+    const og: Record<string, string> = {
+      'og:title': title,
+      'og:description': description,
+      'og:type': 'website',
+      'og:site_name': SITE_NAME,
+      'og:url': canonical,
+      'og:image': OG_IMAGE,
     };
-    for (const [property, content] of Object.entries(ogTags)) {
-      let el = document.querySelector(`meta[property="${property}"]`);
-      if (!el) {
-        el = document.createElement("meta");
-        el.setAttribute("property", property);
-        document.head.appendChild(el);
-      }
-      el.setAttribute("content", content);
+    for (const [key, content] of Object.entries(og)) {
+      upsertMeta(`meta[property="${key}"]`, 'property', key, content);
     }
 
-    // Canonical URL
-    if (canonical) {
-      let canonicalLink = document.querySelector('link[rel="canonical"]');
-      if (!canonicalLink) {
-        canonicalLink = document.createElement("link");
-        canonicalLink.setAttribute("rel", "canonical");
-        document.head.appendChild(canonicalLink);
-      }
-      canonicalLink.setAttribute("href", canonical);
+    const twitter: Record<string, string> = {
+      'twitter:card': 'summary_large_image',
+      'twitter:title': title,
+      'twitter:description': description,
+      'twitter:image': OG_IMAGE,
+    };
+    for (const [key, content] of Object.entries(twitter)) {
+      upsertMeta(`meta[name="${key}"]`, 'name', key, content);
     }
 
-    // JSON-LD structured data
-    if (schema) {
-      const schemaArray = Array.isArray(schema) ? schema : [schema];
-      const existing = document.querySelectorAll('script[type="application/ld+json"]');
-      existing.forEach((el) => {
-        if (el.id?.startsWith("seo-schema")) el.remove();
-      });
-      schemaArray.forEach((schemaObj, i) => {
-        const script = document.createElement("script");
-        script.type = "application/ld+json";
-        script.id = `seo-schema-${i}`;
-        script.text = JSON.stringify(schemaObj);
+    let link = document.querySelector('link[rel="canonical"]');
+    if (!link) {
+      link = document.createElement('link');
+      link.setAttribute('rel', 'canonical');
+      document.head.appendChild(link);
+    }
+    link.setAttribute('href', canonical);
+
+    // Remove only OUR schema blocks before re-adding, so a re-render can't
+    // stack duplicate blocks (which Google treats as an error).
+    document.querySelectorAll('script[data-seo-schema]').forEach((el) => el.remove());
+    if (schemaJson) {
+      (JSON.parse(schemaJson) as Record<string, unknown>[]).forEach((obj) => {
+        const script = document.createElement('script');
+        script.type = 'application/ld+json';
+        script.setAttribute('data-seo-schema', '');
+        script.textContent = JSON.stringify(obj);
         document.head.appendChild(script);
       });
     }
-  }, [title, description, canonical, schema]);
+  }, [title, description, path, schemaJson]);
 
   return null;
 }
 
-// Reusable schema builders
 export const schemas = {
-  website: () => ({
-    "@context": "https://schema.org",
-    "@type": "WebSite",
+  website: (description: string) => ({
+    '@context': 'https://schema.org',
+    '@type': 'WebSite',
     name: SITE_NAME,
     url: SITE_URL,
-    description:
-      "A custom-tailored resume for every role you apply to - precision-engineered to get past the first screening and earn the interview invitation.",
+    description,
   }),
 
-  organization: () => ({
-    "@context": "https://schema.org",
-    "@type": "Organization",
+  organization: (logoPath: string) => ({
+    '@context': 'https://schema.org',
+    '@type': 'Organization',
     name: SITE_NAME,
     url: SITE_URL,
-    logo: `${SITE_URL}/images/logo.png`,
-    sameAs: [],
+    logo: `${SITE_URL}${logoPath}`,
   }),
 
-  breadcrumbs: (items: { name: string; url: string }[]) => ({
-    "@context": "https://schema.org",
-    "@type": "BreadcrumbList",
+  breadcrumbs: (items: readonly { name: string; path: string }[]) => ({
+    '@context': 'https://schema.org',
+    '@type': 'BreadcrumbList',
     itemListElement: items.map((item, i) => ({
-      "@type": "ListItem",
+      '@type': 'ListItem',
       position: i + 1,
       name: item.name,
-      item: item.url,
+      item: `${SITE_URL}${item.path}`,
     })),
   }),
 
-  faqPage: (questions: { q: string; a: string }[]) => ({
-    "@context": "https://schema.org",
-    "@type": "FAQPage",
+  faqPage: (questions: readonly { q: string; a: string }[]) => ({
+    '@context': 'https://schema.org',
+    '@type': 'FAQPage',
     mainEntity: questions.map(({ q, a }) => ({
-      "@type": "Question",
+      '@type': 'Question',
       name: q,
-      acceptedAnswer: {
-        "@type": "Answer",
-        text: a,
-      },
+      acceptedAnswer: { '@type': 'Answer', text: a },
     })),
   }),
+} as const;
 
-  softwareApplication: () => ({
-    "@context": "https://schema.org",
-    "@type": "SoftwareApplication",
-    name: SITE_NAME,
-    applicationCategory: "BusinessApplication",
-    operatingSystem: "Web",
-    url: SITE_URL,
-    offers: {
-      "@type": "Offer",
-      price: "0",
-      priceCurrency: "USD",
-      description: "Free tier with paid upgrades",
-    },
-  }),
-};
+export default SEOHead;

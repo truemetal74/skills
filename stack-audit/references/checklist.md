@@ -41,6 +41,11 @@ Known state: wine-your-sign lacks refresh + dedup (BUG-CLASS); brandician is clo
 - [ ] `prerender.js` + `prerender.routes.js` present and routes in sync with `App.tsx`
 - [ ] `SEOHead` on every public page (title, description, canonical, OG, JSON-LD)
 - [ ] `build:ssg` script; sitemap generated
+- [ ] `prerender.js` has a `MUST_CONTAIN` gate for every route and a `MUST_NOT_CONTAIN`
+      gate for the consent banner (older copies exit 0 on an empty `#root`)
+- [ ] `window.__PRERENDER__` set by `prerender.js` and checked by the consent banner,
+      the analytics loader and any intro/scroll animation
+- [ ] `SEOHead` marks JSON-LD with `data-seo-schema` (what `prerender.js` waits for)
 
 ## 5. Versions (skill: react-app-scaffold)
 

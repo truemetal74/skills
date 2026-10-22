@@ -1,193 +1,186 @@
 /**
- * Pre-rendering script for Static Site Generation (SSG).
+ * Static Site Generation (SSG) prerendering — run after `vite build`.
  *
- * 1. Starts a local server serving the built Vite app
- * 2. Uses Puppeteer to visit each route
- * 3. Waits for React + SEO tags to render
- * 4. Captures HTML and saves to dist/
- * 5. Generates sitemap.xml
+ * WHY THIS EXISTS: this app renders entirely client-side, so the HTML shipped
+ * to a crawler is `<div id="root"></div>` and nothing else. Googlebot runs the
+ * JavaScript and sees the real page; no major AI crawler does — GPTBot,
+ * ClaudeBot and PerplexityBot each fetch the raw HTML once, never execute a
+ * script, and never come back. Without this step the site is, to them, a title
+ * tag and an empty div.
  *
- * Run after `npm run build`: node prerender.js
+ * This serves dist/ locally, visits each public route with a real browser,
+ * waits for React to render, and overwrites the built HTML with the rendered
+ * DOM. Users still get the normal SPA (main.tsx re-renders on load); crawlers
+ * get real HTML on the first byte. Also writes sitemap.xml.
+ *
+ * Run: node prerender.js   (or `npm run build:ssg` for build + prerender)
  */
 
-import puppeteer from "puppeteer";
-import fs from "fs";
-import path from "path";
-import http from "http";
-import handler from "serve-handler";
-import { fileURLToPath } from "url";
-import { routes } from "./prerender.routes.js";
+import puppeteer from 'puppeteer';
+import fs from 'fs';
+import path from 'path';
+import http from 'http';
+import handler from 'serve-handler';
+import { fileURLToPath } from 'url';
+import { routes } from './prerender.routes.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const DIST_DIR = path.join(__dirname, "dist");
+const DIST_DIR = path.join(__dirname, 'dist');
 const PORT = 5174;
 const BASE_URL = `http://localhost:${PORT}`;
-const SITE_URL = "https://example.com"; // PROJECT CONFIG: canonical site URL
+const SITE_URL = 'https://example.com'; // PROJECT CONFIG: canonical site URL
+
+/**
+ * Proof that prerendering actually worked, checked per route. A prerender that
+ * silently captures an empty #root still writes a valid HTML file and still
+ * exits 0 — it just quietly ships the exact bug this script exists to fix, and
+ * nobody notices until the page fails to rank months later. So each route
+ * declares a string that MUST appear in its captured HTML, and a miss fails
+ * the build.
+ */
+// PROJECT CONFIG: one entry per route in prerender.routes.js. Pick text that only
+// appears once the page has really rendered (a headline, a section heading, text
+// fetched at runtime), plus 'application/ld+json' for pages that carry a schema.
+const MUST_CONTAIN = {
+  '/': ['<the landing page headline>', 'application/ld+json'],
+};
+
+/**
+ * The mirror of MUST_CONTAIN: strings that must NOT survive into the captured
+ * HTML, checked for every route.
+ *
+ * The consent banner is client-only chrome. If it were ever baked into the
+ * static snapshot, the first thing an AI crawler read on the page would be a
+ * cookie notice — and the banner's own suppression logic would have silently
+ * regressed without any test failing. `window.__PRERENDER__` (set below) is
+ * what keeps it out; this gate is what proves it stayed out.
+ */
+// PROJECT CONFIG: the banner's own markup and a phrase only the banner uses. Not a
+// generic phrase like "analytics cookies": a prerendered cookie or privacy policy
+// legitimately contains it and would fail the build.
+const MUST_NOT_CONTAIN = ['data-testid="consent-banner"'];
 
 function startServer() {
   return new Promise((resolve) => {
-    const server = http.createServer((request, response) => {
-      return handler(request, response, {
+    const server = http.createServer((req, res) =>
+      handler(req, res, {
         public: DIST_DIR,
         cleanUrls: false,
-        rewrites: [{ source: "**", destination: "/index.html" }],
-      });
-    });
+        rewrites: [{ source: '**', destination: '/index.html' }],
+      }),
+    );
     server.listen(PORT, () => {
-      console.log(`[Prerender] Server running at ${BASE_URL}`);
+      console.log(`[Prerender] Serving ${DIST_DIR} at ${BASE_URL}`);
       resolve(server);
     });
   });
 }
 
-async function waitForPageLoad(page) {
-  try {
-    await page.waitForNetworkIdle({ timeout: 10000 });
-    await page.waitForSelector("#root > *", { timeout: 10000 });
-    // Extra time for SEO tag injection by React effects
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  } catch (error) {
-    console.warn("[Prerender] Timeout waiting for page:", error.message);
-  }
-}
-
 async function prerenderRoute(browser, route) {
-  const url = `${BASE_URL}${route}`;
-  console.log(`[Prerender] Rendering: ${route}`);
-
+  console.log(`[Prerender] Rendering ${route}`);
+  const page = await browser.newPage();
   try {
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1920, height: 1080 });
-    await page.goto(url, { waitUntil: "networkidle0", timeout: 30000 });
-    await waitForPageLoad(page);
+    await page.setViewport({ width: 1280, height: 900 });
+    // Marks this as the build-time render. The consent banner, the analytics
+    // loader and any scroll/intro animation must check it: no consent UI is
+    // rendered into the snapshot, no tag is ever loaded from the build container
+    // (which would otherwise send a phantom pageview to production analytics on
+    // every deploy), and no text is captured mid-animation (hidden or at
+    // opacity 0). Must be set before any navigation.
+    await page.evaluateOnNewDocument(() => {
+      window.__PRERENDER__ = true;
+    });
+    await page.goto(`${BASE_URL}${route}`, { waitUntil: 'networkidle0', timeout: 30000 });
+    await page.waitForSelector('#root > *', { timeout: 15000 });
+    // SEOHead writes <title>/meta/JSON-LD from a useEffect, which runs after
+    // the first paint — wait for its schema block rather than a fixed sleep.
+    await page.waitForSelector('script[data-seo-schema]', { timeout: 15000 });
 
-    const html = await page.content();
+    let html = await page.content();
+    // Vite injects modulepreload links for dynamic chunks with absolute URLs
+    // of THIS server — rewrite to root-relative or they 404 on the real host.
+    html = html.replaceAll(`${BASE_URL}/`, '/');
 
-    let outputPath;
-    if (route === "/") {
-      outputPath = path.join(DIST_DIR, "index.html");
-    } else {
-      const routePath = route.replace(/^\//, "").replace(/\/$/, "");
-      const outputDir = path.join(DIST_DIR, routePath);
-      fs.mkdirSync(outputDir, { recursive: true });
-      outputPath = path.join(outputDir, "index.html");
+    const missing = (MUST_CONTAIN[route] ?? []).filter((needle) => !html.includes(needle));
+    if (missing.length > 0) {
+      throw new Error(`captured HTML is missing required content: ${missing.join(', ')}`);
     }
 
-    fs.writeFileSync(outputPath, html, "utf-8");
-    console.log(`[Prerender] OK ${outputPath}`);
-    await page.close();
-    return { route, success: true };
+    const leaked = MUST_NOT_CONTAIN.filter((needle) => html.includes(needle));
+    if (leaked.length > 0) {
+      throw new Error(`captured HTML contains client-only content: ${leaked.join(', ')}`);
+    }
+
+    const outputPath =
+      route === '/'
+        ? path.join(DIST_DIR, 'index.html')
+        : path.join(DIST_DIR, route.replace(/^\/|\/$/g, ''), 'index.html');
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    fs.writeFileSync(outputPath, html, 'utf-8');
+
+    console.log(`[Prerender] OK ${route} -> ${outputPath} (${(html.length / 1024).toFixed(1)} kB)`);
+    return { route, ok: true };
   } catch (error) {
-    console.error(`[Prerender] FAIL ${route}`, error.message);
-    return { route, success: false, error: error.message };
+    console.error(`[Prerender] FAIL ${route}: ${error.message}`);
+    return { route, ok: false, error: error.message };
+  } finally {
+    await page.close();
   }
 }
 
-function generateSitemap(successfulRoutes) {
-  const today = new Date().toISOString().split("T")[0];
-
-  function getRouteConfig(route) {
-    if (route === "/") return { priority: "1.0", changefreq: "weekly" };
-    if (["/how-it-works", "/features"].includes(route))
-      return { priority: "0.9", changefreq: "monthly" };
-    if (["/pricing", "/faq"].includes(route))
-      return { priority: "0.8", changefreq: "monthly" };
-    if (["/about", "/contact"].includes(route))
-      return { priority: "0.7", changefreq: "monthly" };
-    if (["/login", "/register"].includes(route))
-      return { priority: "0.6", changefreq: "monthly" };
-    if (
-      [
-        "/legal/terms-of-service",
-        "/legal/privacy-policy",
-        "/legal/cookie-policy",
-      ].includes(route)
-    )
-      return { priority: "0.3", changefreq: "yearly" };
-    return { priority: "0.5", changefreq: "monthly" };
-  }
-
-  const urlEntries = successfulRoutes
-    .map((route) => {
-      const config = getRouteConfig(route);
-      return `  <url>
+function writeSitemap(okRoutes) {
+  const today = new Date().toISOString().split('T')[0];
+  const urls = okRoutes
+    .map(
+      (route) => `  <url>
     <loc>${SITE_URL}${route}</loc>
     <lastmod>${today}</lastmod>
-    <changefreq>${config.changefreq}</changefreq>
-    <priority>${config.priority}</priority>
-  </url>`;
-    })
-    .join("\n");
+    <changefreq>monthly</changefreq>
+    <priority>${route === '/' ? '1.0' : '0.5'}</priority>
+  </url>`,
+    )
+    .join('\n');
 
   const sitemap = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-${urlEntries}
+${urls}
 </urlset>
 `;
-
-  const sitemapPath = path.join(DIST_DIR, "sitemap.xml");
-  fs.writeFileSync(sitemapPath, sitemap, "utf-8");
-  console.log(
-    `[Prerender] Sitemap: ${successfulRoutes.length} URLs -> ${sitemapPath}`
-  );
+  fs.writeFileSync(path.join(DIST_DIR, 'sitemap.xml'), sitemap, 'utf-8');
+  console.log(`[Prerender] Sitemap: ${okRoutes.length} URL(s)`);
 }
 
-async function prerender() {
-  console.log(`[Prerender] Starting... ${routes.length} routes`);
-
+async function main() {
   if (!fs.existsSync(DIST_DIR)) {
-    console.error('[Prerender] dist/ not found. Run "npm run build" first.');
+    console.error('[Prerender] dist/ not found — run `npm run build` first.');
     process.exit(1);
   }
 
   const server = await startServer();
-
   const browser = await puppeteer.launch({
-    headless: "new",
+    headless: 'new',
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-    ],
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   });
 
-  const results = { success: 0, failed: 0, successfulRoutes: [], errors: [] };
-
+  const results = [];
   for (const route of routes) {
-    const result = await prerenderRoute(browser, route);
-    if (result.success) {
-      results.success++;
-      results.successfulRoutes.push(route);
-    } else {
-      results.failed++;
-      results.errors.push({ route, error: result.error });
-    }
+    results.push(await prerenderRoute(browser, route));
   }
 
   await browser.close();
   server.close();
 
-  if (results.successfulRoutes.length > 0) {
-    generateSitemap(results.successfulRoutes);
-  }
+  const ok = results.filter((r) => r.ok);
+  const failed = results.filter((r) => !r.ok);
+  if (ok.length > 0) writeSitemap(ok.map((r) => r.route));
 
-  console.log(
-    `\n[Prerender] Done: ${results.success} OK, ${results.failed} failed`
-  );
-  if (results.errors.length > 0) {
-    results.errors.forEach(({ route, error }) =>
-      console.log(`  FAIL ${route}: ${error}`)
-    );
-  }
-
-  if (results.failed > 0) process.exit(1);
+  console.log(`\n[Prerender] Done: ${ok.length} OK, ${failed.length} failed`);
+  if (failed.length > 0) process.exit(1);
 }
 
-prerender().catch((error) => {
-  console.error("[Prerender] Fatal:", error);
+main().catch((error) => {
+  console.error('[Prerender] Fatal:', error);
   process.exit(1);
 });
