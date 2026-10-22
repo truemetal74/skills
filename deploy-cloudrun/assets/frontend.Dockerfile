@@ -11,7 +11,13 @@ ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
 WORKDIR /app
 COPY package*.json ./
-RUN npm install --legacy-peer-deps
+# npm ci reproduces the committed lockfile exactly. Do NOT use
+# `npm install --legacy-peer-deps`: it skips peer dependencies (e.g.
+# @testing-library/dom, a peer of @testing-library/react v16), which breaks
+# the in-container `tsc` gate that typechecks test files even though the
+# same build passes locally. If a project has no package-lock.json, commit
+# one first (plain `npm install` locally) rather than weakening this line.
+RUN npm ci
 COPY . .
 
 # With SSG: TypeScript compile + Vite build + Puppeteer prerender + sitemap

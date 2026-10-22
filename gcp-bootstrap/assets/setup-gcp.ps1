@@ -22,7 +22,15 @@ param(
     [string]$ServiceAccountName = "worker"  # canonical runtime SA name across all projects
 )
 
-$ErrorActionPreference = "Stop"
+# NOT "Stop": gcloud/gsutil write progress AND success messages to stderr.
+# Under Windows PowerShell 5.1, whenever this script's output is redirected
+# (coding agents, CI, `... 2>&1 | tee`), every such stderr line surfaces as a
+# NativeCommandError record — with "Stop" the FIRST one terminates the script
+# even though the command succeeded (exit 0). Seen live 2026-07-09: the run
+# died on `services enable` at "Operation ... finished successfully."
+# All failure handling below is explicit via $LASTEXITCODE, which is the only
+# reliable success signal for native commands.
+$ErrorActionPreference = "Continue"
 
 if (-not $ProjectId) {
     $ProjectId = gcloud config get-value project 2>$null
